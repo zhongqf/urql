@@ -19,7 +19,6 @@ import {
   CombinedError,
   OperationContext,
   RequestPolicy,
-  OperationResult,
   Operation,
 } from '@urql/core';
 
@@ -54,7 +53,7 @@ export type UseQueryResponse<Data = any, Variables = object> = [
 /** Convert the Source to a React Suspense source on demand */
 function toSuspenseSource<T>(source: Source<T>): Source<T> {
   const shared = share(source);
-  let cache: T | void;
+  let hasResult = false;
   let resolve: (value: T) => void;
 
   return sink => {
@@ -65,19 +64,15 @@ function toSuspenseSource<T>(source: Source<T>): Source<T> {
       takeWhile(result => {
         // The first result that is received will resolve the suspense
         // promise after waiting for a microtick
-        if (cache === undefined) Promise.resolve(result).then(resolve);
-        cache = result;
+        if (result) Promise.resolve(result).then(resolve);
+        hasResult = true;
         return !hasSuspended;
       })
     )(sink);
 
     // If we haven't got a previous result then start suspending
     // otherwise issue the last known result immediately
-    if (cache !== undefined) {
-      const signal = [cache] as [T] & { tag: 1 };
-      signal.tag = 1;
-      sink(signal);
-    } else {
+    if (!hasResult) {
       hasSuspended = true;
       sink(0 /* End */);
       throw new Promise<T>(_resolve => {
@@ -90,8 +85,6 @@ function toSuspenseSource<T>(source: Source<T>): Source<T> {
 const isSuspense = (client: Client, context?: Partial<OperationContext>) =>
   client.suspense && (!context || context.suspense !== false);
 
-const sources = new Map<number, Source<OperationResult>>();
-
 export function useQuery<Data = any, Variables = object>(
   args: UseQueryArgs<Variables, Data>
 ): UseQueryResponse<Data, Variables> {
@@ -103,30 +96,17 @@ export function useQuery<Data = any, Variables = object>(
   // Create a new query-source from client.executeQuery
   const makeQuery$ = useCallback(
     (opts?: Partial<OperationContext>) => {
+      const source = client.executeQuery(request, {
+        requestPolicy: args.requestPolicy,
+        pollInterval: args.pollInterval,
+        ...args.context,
+        ...opts,
+      });
+
       // Determine whether suspense is enabled for the given operation
-      const suspense = isSuspense(client, args.context);
-      let source: Source<OperationResult> | void = suspense
-        ? sources.get(request.key)
-        : undefined;
-
-      if (!source) {
-        source = client.executeQuery(request, {
-          requestPolicy: args.requestPolicy,
-          pollInterval: args.pollInterval,
-          ...args.context,
-          ...opts,
-        });
-
-        // Create a suspense source and cache it for the given request
-        if (suspense) {
-          source = toSuspenseSource(source);
-          if (typeof window !== 'undefined') {
-            sources.set(request.key, source);
-          }
-        }
-      }
-
-      return source;
+      return isSuspense(client, args.context)
+        ? toSuspenseSource(source)
+        : source;
     },
     [client, request, args.requestPolicy, args.pollInterval, args.context]
   );
