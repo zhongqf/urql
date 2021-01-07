@@ -5,6 +5,7 @@ import {
   makeSubject,
   onEnd,
   onStart,
+  onPush,
   pipe,
   share,
   Source,
@@ -67,10 +68,6 @@ export interface ClientOptions {
   maskTypename?: boolean;
 }
 
-interface ActiveOperations {
-  [operationKey: string]: number;
-}
-
 export const createClient = (opts: ClientOptions) => new Client(opts);
 
 /** The URQL application-wide client library. Each execute method starts a GraphQL request and returns a stream of results. */
@@ -94,7 +91,7 @@ export class Client {
   dispatchOperation: (operation?: Operation | void) => void;
   operations$: Source<Operation>;
   results$: Source<OperationResult>;
-  activeOperations = Object.create(null) as ActiveOperations;
+  activeSources = new Map<number, Source<OperationResult>>();
   queue: Operation[] = [];
 
   constructor(opts: ClientOptions) {
@@ -139,7 +136,7 @@ export class Client {
       // operation's exchange results
       if (
         operation.kind === 'mutation' ||
-        (this.activeOperations[operation.key] || 0) > 0
+        this.activeSources.has(operation.key)
       ) {
         this.queue.push(operation);
         if (!isOperationBatchActive) {
@@ -198,81 +195,76 @@ export class Client {
       this.createOperationContext(opts)
     );
 
-  /** Counts up the active operation key and dispatches the operation */
-  private onOperationStart(operation: Operation) {
-    const { key } = operation;
-    this.activeOperations[key] = (this.activeOperations[key] || 0) + 1;
-    this.dispatchOperation(operation);
-  }
-
-  /** Deletes an active operation's result observable and sends a teardown signal through the exchange pipeline */
-  private onOperationEnd(operation: Operation) {
-    const { key } = operation;
-    const prevActive = this.activeOperations[key] || 0;
-    const newActive = (this.activeOperations[key] =
-      prevActive <= 0 ? 0 : prevActive - 1);
-    // Check whether this operation has now become inactive
-    if (newActive <= 0) {
-      // Delete all related queued up operations for the inactive one
-      for (let i = this.queue.length - 1; i >= 0; i--)
-        if (this.queue[i].key === operation.key) this.queue.splice(i, 1);
-      // Issue the cancellation teardown operation
-      this.dispatchOperation(
-        makeOperation('teardown', operation, operation.context)
-      );
-    }
-  }
-
   /** Executes an Operation by sending it through the exchange pipeline It returns an observable that emits all related exchange results and keeps track of this observable's subscribers. A teardown signal will be emitted when no subscribers are listening anymore. */
   executeRequestOperation<Data = any, Variables = object>(
     operation: Operation<Data, Variables>
   ): Source<OperationResult<Data, Variables>> {
-    let operationResults$ = pipe(
-      this.results$,
-      filter((res: OperationResult) => res.operation.key === operation.key)
-    ) as Source<OperationResult<Data, Variables>>;
+    const { key } = operation;
+    const teardown = makeOperation('teardown', operation, operation.context);
 
-    if (this.maskTypename) {
-      operationResults$ = pipe(
-        operationResults$,
-        map(res => {
-          res.data = maskTypename(res.data);
-          return res;
-        })
+    let result$ = this.activeSources.get(key);
+    if (!result$) {
+      result$ = pipe(
+        this.results$,
+        filter(result => result.operation.key === key),
+        takeUntil(
+          pipe(
+            this.operations$,
+            filter(operation => operation.key === key)
+          )
+        )
+      ) as Source<OperationResult<Data, Variables>>;
+
+      if (this.maskTypename) {
+        result$ = pipe(
+          result$,
+          map(result => {
+            result.data = maskTypename(result.data);
+            return result;
+          })
+        );
+      }
+
+      if (operation.kind === 'mutation') {
+        return pipe(
+          result$,
+          onStart<OperationResult>(() => {
+            this.dispatchOperation(operation);
+          }),
+          take(1)
+        );
+      }
+
+      let value: OperationResult | undefined;
+
+      result$ = pipe(
+        result$,
+        onStart(() => {
+          this.activeSources.set(key, result$!);
+          this.dispatchOperation(operation);
+        }),
+        onPush(result => {
+          value = result;
+        }),
+        onEnd(() => {
+          this.activeSources.delete(key);
+          for (let i = this.queue.length - 1; i >= 0; i--)
+            if (this.queue[i].key === key) this.queue.splice(i, 1);
+          this.dispatchOperation(teardown);
+        }),
+        share
       );
+
+      result$ = merge([
+        pipe(fromValue(value!), filter<OperationResult>(Boolean)),
+        result$,
+      ]);
     }
-
-    if (operation.kind === 'mutation') {
-      // A mutation is always limited to just a single result and is never shared
-      return pipe(
-        operationResults$,
-        onStart<OperationResult>(() => this.dispatchOperation(operation)),
-        take(1)
-      );
-    }
-
-    const teardown$ = pipe(
-      this.operations$,
-      filter(
-        (op: Operation) => op.kind === 'teardown' && op.key === operation.key
-      )
-    );
-
-    const result$ = pipe(
-      operationResults$,
-      takeUntil(teardown$),
-      onStart<OperationResult>(() => {
-        this.onOperationStart(operation);
-      }),
-      onEnd<OperationResult>(() => {
-        this.onOperationEnd(operation);
-      })
-    );
 
     if (operation.kind === 'query' && operation.context.pollInterval) {
       return pipe(
         merge([fromValue(0), interval(operation.context.pollInterval)]),
-        switchMap(() => result$)
+        switchMap(() => result$!)
       );
     }
 
